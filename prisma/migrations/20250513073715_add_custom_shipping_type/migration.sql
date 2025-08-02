@@ -1,0 +1,5 @@
+-- AlterTable
+ALTER TABLE `shipping_methods` MODIFY `type` ENUM('FREE_SHIPPING', 'COURIER_PARTNER', 'CUSTOM_SHIPPING') NOT NULL;
+
+-- AlterTable
+ALTER TABLE `transaction_shipping` MODIFY `method_type` ENUM('FREE_SHIPPING', 'COURIER_PARTNER', 'CUSTOM_SHIPPING') NOT NULL;
