@@ -1,148 +1,161 @@
-// app/api/print-bills/[id]/route.ts
+import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+import { getServerSession } from 'next-auth/next';
+import { authOptions } from '@/lib/auth-options';
+import { revalidatePath } from 'next/cache';
+import { sendWhatsAppMessageByOrganisation } from '@/lib/whatsapp';
 
-import { authOptions } from "@/lib/auth-options";
-import { sendOrderStatusSMS, splitProducts } from "@/lib/msg91";
-import { prisma } from "@/lib/prisma";
-import { getServerSession } from "next-auth";
-import { revalidatePath } from "next/cache";
-import { NextResponse } from "next/server";
+// --- Constants for better maintainability ---
+const NEW_STATUS = 'packed';
+const WHATSAPP_TEMPLATE_NAME = 'order_packed_notification';
 
-export async function GET(request: Request, { params }: { params: { id: string } }) {
+/**
+ * Handles sending the WhatsApp notification.
+ * This function is separated for clarity and reusability.
+ */
+async function sendPackingNotification(transactionRecord: any) {
+  if (!transactionRecord.customer?.phone) {
+    const message = `Customer phone number not available for WhatsApp notification.`;
+    console.log(`⚠️  [Org ${transactionRecord.organisationId}] ${message}`);
+    return { success: false, error: message };
+  }
+
+  try {
+    const customerPhone = transactionRecord.customer.phone;
+    const orderId = transactionRecord.companyBillNo.toString();
+    const productList = transactionRecord.itemName || 'Your items';
+    const orderStatus = 'Packed and Ready for Dispatch';
+    const companyName = transactionRecord.organisation?.name || 'Your Store';
+
+    console.log(`📱 [Org ${transactionRecord.organisationId}] Preparing packing notification for ${customerPhone}`);
+
+    const whatsappResult = await sendWhatsAppMessageByOrganisation({
+      organisationId: transactionRecord.organisationId,
+      phone: customerPhone,
+      templateName: WHATSAPP_TEMPLATE_NAME,
+      variables: [orderId, productList, orderStatus, companyName],
+    });
+
+    console.log(`✅ [Org ${transactionRecord.organisationId}] WhatsApp notification sent successfully:`, {
+      messageId: whatsappResult?.messages?.[0]?.id,
+    });
+    return { success: true, data: whatsappResult };
+
+  } catch (error: any) {
+    console.error(`❌ [Org ${transactionRecord.organisationId}] WhatsApp notification failed:`, error.message);
+    // Don't fail the entire request, just report the error
+    return { success: false, error: error.message };
+  }
+}
+
+// --- API Route Handler ---
+export async function POST(
+  request: Request,
+  context: { params: { id: string } }
+) {
   try {
     const session = await getServerSession(authOptions);
-    if (!session) {
+    if (!session?.user?.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-        const companyBillId = parseInt(params.id); // This is now the company-specific bill ID
+    const companyBillNo = parseInt(context.params.id, 10);
+    if (isNaN(companyBillNo)) {
+      return NextResponse.json({ error: 'Invalid bill number format' }, { status: 400 });
+    }
 
+    const organisationId = parseInt(session.user.id, 10);
+    let updatedTransaction;
 
-    const organisationId = parseInt(session.user.id);
-
-    const bill = await prisma.transactionRecord.findFirst({
-      where: {
-        companyBillNo: companyBillId, // <-- CHANGE THIS
-        organisationId,
-      },
-      include: {
-        customer: true,
-        items: {
-          include: {
-            product: true,
+    // --- Using a Database Transaction for Atomicity ---
+    // This ensures that we find and update the record in one safe operation.
+    try {
+      updatedTransaction = await prisma.$transaction(async (tx) => {
+        // 1. Find the transaction record within the transaction
+        const transactionRecord = await tx.transactionRecord.findFirst({
+          where: {
+            companyBillNo: companyBillNo,
+            organisationId: organisationId,
           },
-        },
-        TransactionShipping: true, // Use transactionShipping instead of shipping
-      },
-    });
+          include: {
+            customer: true, // For phone number
+            organisation: true, // For company name
+          },
+        });
 
+        if (!transactionRecord) {
+            // By throwing an error here, the transaction is automatically rolled back.
+            throw new Error('NOT_FOUND');
+        }
+        
+        // Optional: Add a check to prevent re-packing an already packed order
+        if (transactionRecord.status === NEW_STATUS) {
+            throw new Error('ALREADY_PACKED');
+        }
 
-    console.log(bill);
-    
+        // 2. Update the record within the same transaction
+        const updatedRecord = await tx.transactionRecord.update({
+          where: {
+            id: transactionRecord.id, // Use the primary key for updates for reliability
+          },
+          data: {
+            status: NEW_STATUS,
+          },
+          include: {
+            customer: true,
+            organisation: true,
+          }
+        });
 
-    if (!bill) {
-      return NextResponse.json({ error: 'Bill not found' }, { status: 404 });
-    }
-
-    await prisma.transactionRecord.update({
-      where: {
-        id: bill.id
-      },
-      data: {
-        status: 'printed'
-      }
-    });
-
-    const organisation = await prisma.organisation.findUnique({
-      where: { id: organisationId },
-    });
-
-    const tax = await prisma.tax.findFirst({
-      where: {
-        organisationId,
-        autoApply: true
-      }
-    });
-    
-
-    const shippingCost = bill.TransactionShipping[0]?.totalCost || 0;
-    const taxAmount = bill.taxAmount || 0;
-    const subtotal = bill.totalPrice - taxAmount - shippingCost
-
-    const printData = {
-      bill_id: bill.id,
-      bill_details: {
-        bill_no: bill.companyBillNo, // <-- CHANGE THIS
-        date: bill.date.toISOString().split('T')[0],
-        time: new Date(bill.time).toLocaleTimeString(),
-      },
-      customer_details: {
-        id: bill.customer?.id,
-        name: bill.customer?.name,
-        phone: bill.customer?.phone,
-        flat_no: bill.customer?.flatNo,
-        street: bill.customer?.street,
-        district: bill.customer?.district,
-        state: bill.customer?.state,
-        pincode: bill.customer?.pincode,
-      },
-      organisation_details: organisation,
-      product_details: bill.items.map(item => ({
-        productName: item.product.name,
-        quantity: item.quantity,
-        unitPrice: item.product.sellingPrice,
-        amount: item.totalPrice,
-      })),
-      shipping_details: bill.TransactionShipping.length!=0 ? {
-        method_name: bill.TransactionShipping[0].methodName,
-        method_type: bill.TransactionShipping[0].methodType,
-        base_rate: bill.TransactionShipping[0].baseRate,
-        weight_charge: bill.TransactionShipping[0].weightCharge,
-        total_weight: bill.TransactionShipping[0].totalWeight,
-        total_cost: bill.TransactionShipping[0].totalCost,
-      } : null,
-
-      // If custom shipping exists, include it here as well
-      custom_shipping_details: bill.customShippingDetails || null, // Assuming `customShippingDetails` exists in the bill object
-    
-  // ✅ Add these fields:
-      subtotal: subtotal,
-      shipping: shippingCost,
-      taxAmount: taxAmount,
-      taxName: tax?.name || "Tax",
-      total: bill.totalPrice
-};
-
-    console.log(printData);
-    
-
-    const products = bill.items.map((item) => item.product.name);
-    const productList = products.join(', ');
-    const [productsPart1, productsPart2] = splitProducts(productList);
-
-
-
-    const smsVariables = {
-      var1: organisation?.shopName || '',
-      var2: productsPart1,
-      var3: productsPart2,
-      var4: organisation?.shopName || '',
-    };
-
-    if (bill.customer?.phone) {
-      await sendOrderStatusSMS({
-        phone: bill.customer.phone,
-        organisationId: organisationId,
-        status: 'packed',
-        smsVariables
+        return updatedRecord;
       });
+    } catch (error: any) {
+      // Catch errors from the transaction
+      if (error.message === 'NOT_FOUND') {
+        return NextResponse.json(
+          { error: 'Bill not found or you do not have permission to access it.' },
+          { status: 404 }
+        );
+      }
+      if (error.message === 'ALREADY_PACKED') {
+        return NextResponse.json(
+          { error: 'This bill has already been marked as packed.' },
+          { status: 409 } // 409 Conflict is a good status code here
+        );
+      }
+      // For other unexpected database errors
+      throw error;
     }
 
+    // --- Send WhatsApp Notification (after successful DB update) ---
+    const notificationResult = await sendPackingNotification(updatedTransaction);
+
+    // --- Revalidate cache to show updated status on the frontend ---
     revalidatePath('/transactions/online');
     revalidatePath('/dashboard');
 
-    return NextResponse.json(printData);
+    return NextResponse.json({
+      success: true,
+      message: 'Bill status updated to packed.',
+      whatsapp: {
+        sent: notificationResult.success,
+        result: notificationResult.success ? notificationResult.data : null,
+        error: notificationResult.success ? null : notificationResult.error,
+      },
+      data: {
+        organisationId: updatedTransaction.organisationId,
+        billNumber: updatedTransaction.companyBillNo,
+        newStatus: updatedTransaction.status,
+      }
+    });
+
   } catch (error: any) {
-    console.error('Print error:', error.message);
-    return NextResponse.json({ error: 'Failed to fetch bill details' }, { status: 500 });
+    console.error('Failed to update packing status:', error.message, {
+        params: context.params,
+    });
+    return NextResponse.json(
+      { error: 'An internal error occurred while updating the packing status.' },
+      { status: 500 }
+    );
   }
 }
