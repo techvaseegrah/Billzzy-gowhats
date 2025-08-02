@@ -62,6 +62,7 @@ model Organisation {
   MandateNotification MandateNotification[]
   customShippings     CustomShipping[] // <--- NEW RELATION
   taxes               Tax[] // <--- NEW RELATION
+  gowhats   Gowhats?
 
   @@index([resetToken])
   @@map("organisation")
@@ -183,6 +184,17 @@ model TransactionItem {
 
   @@map("transaction_items")
 }
+model Gowhats {
+  id              Int           @id @default(autoincrement())
+  organisation    Organisation  @relation(fields: [organisationId], references: [id])
+  organisationId  Int           @unique
+  whatsappNumber  String
+  accessToken    String   @db.Text  // 👈 This is the key change - from String to Text
+  businessId      String
+  phoneNumberId   String
+}
+
+
 
 model Customer {
   id             Int     @id @default(autoincrement())
